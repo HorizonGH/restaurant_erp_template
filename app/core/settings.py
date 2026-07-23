@@ -6,7 +6,8 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    pass
+    log_level: str = "INFO"
+    log_json: bool = True
 
 
 settings = Settings()
