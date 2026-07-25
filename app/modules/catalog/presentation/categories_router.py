@@ -11,6 +11,7 @@ from app.modules.catalog.application.schemas import (
     CategoryCreateInput,
     CategoryOutput,
     CategoryUpdateInput,
+    SelectOutput,
 )
 from app.modules.catalog.application.service import CategoryService
 
@@ -19,6 +20,14 @@ router = APIRouter(prefix="/categories", tags=["Catalog - Categories"])
 
 def get_service(session: Annotated[AsyncSession, Depends(get_session)]) -> CategoryService:
     return CategoryService(session)
+
+
+@router.get("/select", response_model=APIResponse[list[SelectOutput]])
+async def select_categories(
+    service: CategoryService = Depends(get_service),
+) -> APIResponse[list[SelectOutput]]:
+    items = await service.select()
+    return APIResponse(data=[SelectOutput.model_validate(i) for i in items])
 
 
 @router.get("/", response_model=APIResponse[Page[CategoryOutput]])

@@ -4,8 +4,13 @@ from uuid import UUID
 from pydantic import Field
 
 from app.core.shared.application.validators import StrippedStr
-from app.core.shared.presentation.schemas import BaseInputSchema, BaseOutputSchema
+from app.core.shared.presentation.schemas import BaseInputSchema, BaseOutputSchema, BaseSchema
 from app.modules.catalog.domain.enums import UnitType
+
+
+class SelectOutput(BaseSchema):
+    entity_id: UUID
+    name: str
 
 
 # --- Category ---

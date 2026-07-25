@@ -20,13 +20,23 @@ class BaseRepository(Generic[EntityT]):
         self.session = session
 
     async def get(self, id: UUID) -> EntityT | None:
-        return await self.session.get(self.model, id)
+        result = await self.session.execute(
+            select(self.model).where(
+                self.model.entity_id == id,
+                self.model.is_deleted.is_(False),
+            )
+        )
+        return result.scalar_one_or_none()
 
     async def get_or_404(self, id: UUID) -> EntityT:
         obj = await self.get(id)
         if obj is None:
             raise NotFoundException(f"{self.model.__name__} not found")
         return obj
+
+    async def soft_delete(self, obj: EntityT) -> None:
+        obj.is_deleted = True  # type: ignore[attr-defined]
+        await self.session.flush()
 
     async def list(
         self, filterset_cls: type[AsyncFilterSet[EntityT]], params: dict[str, Any]
