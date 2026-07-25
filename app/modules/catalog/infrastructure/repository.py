@@ -15,6 +15,12 @@ from app.modules.catalog.domain.models import (
 class CategoryRepository(BaseRepository[Category]):
     model = Category
 
+    async def list_active(self) -> list[Category]:
+        result = await self.session.execute(
+            select(Category).where(Category.is_deleted.is_(False)).order_by(Category.name)
+        )
+        return list(result.scalars().all())
+
     async def has_children(self, category_id: UUID) -> bool:
         result = await self.session.execute(
             select(func.count()).where(Category.parent_id == category_id)
@@ -37,6 +43,12 @@ class CategoryRepository(BaseRepository[Category]):
 class UnitOfMeasureRepository(BaseRepository[UnitOfMeasure]):
     model = UnitOfMeasure
 
+    async def list_active(self) -> list[UnitOfMeasure]:
+        result = await self.session.execute(
+            select(UnitOfMeasure).where(UnitOfMeasure.is_deleted.is_(False)).order_by(UnitOfMeasure.name)
+        )
+        return list(result.scalars().all())
+
     async def get_by_abbreviation(self, abbreviation: str) -> UnitOfMeasure | None:
         result = await self.session.execute(
             select(UnitOfMeasure).where(UnitOfMeasure.abbreviation == abbreviation)
@@ -46,6 +58,14 @@ class UnitOfMeasureRepository(BaseRepository[UnitOfMeasure]):
 
 class IngredientRepository(BaseRepository[Ingredient]):
     model = Ingredient
+
+    async def list_active(self) -> list[Ingredient]:
+        result = await self.session.execute(
+            select(Ingredient)
+            .where(Ingredient.is_active.is_(True), Ingredient.is_deleted.is_(False))
+            .order_by(Ingredient.name)
+        )
+        return list(result.scalars().all())
 
     async def get_by_sku(self, sku: str) -> Ingredient | None:
         result = await self.session.execute(
@@ -62,6 +82,14 @@ class IngredientRepository(BaseRepository[Ingredient]):
 
 class SupplierRepository(BaseRepository[Supplier]):
     model = Supplier
+
+    async def list_active(self) -> list[Supplier]:
+        result = await self.session.execute(
+            select(Supplier)
+            .where(Supplier.is_active.is_(True), Supplier.is_deleted.is_(False))
+            .order_by(Supplier.name)
+        )
+        return list(result.scalars().all())
 
 
 class SupplierIngredientRepository(BaseRepository[SupplierIngredient]):

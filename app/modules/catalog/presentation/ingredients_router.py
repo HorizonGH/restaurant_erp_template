@@ -12,6 +12,7 @@ from app.modules.catalog.application.schemas import (
     IngredientDetailOutput,
     IngredientOutput,
     IngredientUpdateInput,
+    SelectOutput,
     SupplierIngredientLinkInput,
     SupplierIngredientOutput,
 )
@@ -30,6 +31,14 @@ def get_link_service(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SupplierIngredientService:
     return SupplierIngredientService(session)
+
+
+@router.get("/select", response_model=APIResponse[list[SelectOutput]])
+async def select_ingredients(
+    service: IngredientService = Depends(get_service),
+) -> APIResponse[list[SelectOutput]]:
+    items = await service.select()
+    return APIResponse(data=[SelectOutput.model_validate(i) for i in items])
 
 
 @router.get("/", response_model=APIResponse[Page[IngredientOutput]])
@@ -88,6 +97,24 @@ async def delete_ingredient(
     service: IngredientService = Depends(get_service),
 ) -> None:
     await service.delete(ingredient_id)
+
+
+@router.patch("/{ingredient_id}/activate", response_model=APIResponse[IngredientOutput])
+async def activate_ingredient(
+    ingredient_id: UUID,
+    service: IngredientService = Depends(get_service),
+) -> APIResponse[IngredientOutput]:
+    ingredient = await service.set_active(ingredient_id, is_active=True)
+    return APIResponse(data=IngredientOutput.model_validate(ingredient))
+
+
+@router.patch("/{ingredient_id}/deactivate", response_model=APIResponse[IngredientOutput])
+async def deactivate_ingredient(
+    ingredient_id: UUID,
+    service: IngredientService = Depends(get_service),
+) -> APIResponse[IngredientOutput]:
+    ingredient = await service.set_active(ingredient_id, is_active=False)
+    return APIResponse(data=IngredientOutput.model_validate(ingredient))
 
 
 @router.get(

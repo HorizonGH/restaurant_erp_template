@@ -46,6 +46,9 @@ class CategoryService:
     async def get(self, category_id: UUID) -> Category:
         return await self.repo.get_or_404(category_id)
 
+    async def select(self) -> list[Category]:
+        return await self.repo.list_active()
+
     async def list(self, params: dict) -> tuple[Sequence[Category], int]:
         return await self.repo.list(CategoryFilterSet, params)
 
@@ -78,7 +81,7 @@ class CategoryService:
             raise CategoryInUseException("Cannot delete category with sub-categories")
         if await self.repo.has_ingredients(category_id):
             raise CategoryInUseException("Cannot delete category with ingredients")
-        await self.repo.delete(category)
+        await self.repo.soft_delete(category)
         await self.session.commit()
 
 
@@ -89,6 +92,9 @@ class UnitOfMeasureService:
 
     async def get(self, unit_id: UUID) -> UnitOfMeasure:
         return await self.repo.get_or_404(unit_id)
+
+    async def select(self) -> list[UnitOfMeasure]:
+        return await self.repo.list_active()
 
     async def list(self, params: dict) -> tuple[Sequence[UnitOfMeasure], int]:
         return await self.repo.list(UnitOfMeasureFilterSet, params)
@@ -122,7 +128,7 @@ class UnitOfMeasureService:
 
     async def delete(self, unit_id: UUID) -> None:
         unit = await self.repo.get_or_404(unit_id)
-        await self.repo.delete(unit)
+        await self.repo.soft_delete(unit)
         await self.session.commit()
 
 
@@ -135,6 +141,9 @@ class IngredientService:
 
     async def get(self, ingredient_id: UUID) -> Ingredient:
         return await self.repo.get_or_404(ingredient_id)
+
+    async def select(self) -> list[Ingredient]:
+        return await self.repo.list_active()
 
     async def list(self, params: dict) -> tuple[Sequence[Ingredient], int]:
         return await self.repo.list(IngredientFilterSet, params)
@@ -162,8 +171,14 @@ class IngredientService:
 
     async def delete(self, ingredient_id: UUID) -> None:
         ingredient = await self.repo.get_or_404(ingredient_id)
-        await self.repo.delete(ingredient)
+        await self.repo.soft_delete(ingredient)
         await self.session.commit()
+
+    async def set_active(self, ingredient_id: UUID, *, is_active: bool) -> Ingredient:
+        ingredient = await self.repo.get_or_404(ingredient_id)
+        ingredient = await self.repo.update(ingredient, is_active=is_active)
+        await self.session.commit()
+        return ingredient
 
 
 class SupplierService:
@@ -173,6 +188,9 @@ class SupplierService:
 
     async def get(self, supplier_id: UUID) -> Supplier:
         return await self.repo.get_or_404(supplier_id)
+
+    async def select(self) -> list[Supplier]:
+        return await self.repo.list_active()
 
     async def list(self, params: dict) -> tuple[Sequence[Supplier], int]:
         return await self.repo.list(SupplierFilterSet, params)
@@ -191,8 +209,14 @@ class SupplierService:
 
     async def delete(self, supplier_id: UUID) -> None:
         supplier = await self.repo.get_or_404(supplier_id)
-        await self.repo.delete(supplier)
+        await self.repo.soft_delete(supplier)
         await self.session.commit()
+
+    async def set_active(self, supplier_id: UUID, *, is_active: bool) -> Supplier:
+        supplier = await self.repo.get_or_404(supplier_id)
+        supplier = await self.repo.update(supplier, is_active=is_active)
+        await self.session.commit()
+        return supplier
 
 
 class SupplierIngredientService:

@@ -24,5 +24,9 @@ class TimestampMixin:
     )
 
 
-class BaseEntity(Base, UUIDMixin, TimestampMixin):
+class SoftDeleteMixin:
+    is_deleted: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+
+class BaseEntity(Base, UUIDMixin, TimestampMixin, SoftDeleteMixin):
     __abstract__ = True

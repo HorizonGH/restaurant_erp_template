@@ -8,6 +8,7 @@ from app.core.shared.infrastructure.database import get_session
 from app.core.shared.presentation.pagination import Page, PageParams
 from app.core.shared.presentation.responses import APIResponse
 from app.modules.catalog.application.schemas import (
+    SelectOutput,
     UnitOfMeasureCreateInput,
     UnitOfMeasureOutput,
     UnitOfMeasureUpdateInput,
@@ -22,6 +23,14 @@ def get_service(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> UnitOfMeasureService:
     return UnitOfMeasureService(session)
+
+
+@router.get("/select", response_model=APIResponse[list[SelectOutput]])
+async def select_units(
+    service: UnitOfMeasureService = Depends(get_service),
+) -> APIResponse[list[SelectOutput]]:
+    items = await service.select()
+    return APIResponse(data=[SelectOutput.model_validate(i) for i in items])
 
 
 @router.get("/", response_model=APIResponse[Page[UnitOfMeasureOutput]])

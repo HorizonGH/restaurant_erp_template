@@ -8,6 +8,7 @@ from app.core.shared.infrastructure.database import get_session
 from app.core.shared.presentation.pagination import Page, PageParams
 from app.core.shared.presentation.responses import APIResponse
 from app.modules.catalog.application.schemas import (
+    SelectOutput,
     SupplierCreateInput,
     SupplierIngredientLinkInput,
     SupplierIngredientOutput,
@@ -29,6 +30,14 @@ def get_link_service(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SupplierIngredientService:
     return SupplierIngredientService(session)
+
+
+@router.get("/select", response_model=APIResponse[list[SelectOutput]])
+async def select_suppliers(
+    service: SupplierService = Depends(get_service),
+) -> APIResponse[list[SelectOutput]]:
+    items = await service.select()
+    return APIResponse(data=[SelectOutput.model_validate(i) for i in items])
 
 
 @router.get("/", response_model=APIResponse[Page[SupplierOutput]])
@@ -81,6 +90,24 @@ async def delete_supplier(
     service: SupplierService = Depends(get_service),
 ) -> None:
     await service.delete(supplier_id)
+
+
+@router.patch("/{supplier_id}/activate", response_model=APIResponse[SupplierOutput])
+async def activate_supplier(
+    supplier_id: UUID,
+    service: SupplierService = Depends(get_service),
+) -> APIResponse[SupplierOutput]:
+    supplier = await service.set_active(supplier_id, is_active=True)
+    return APIResponse(data=SupplierOutput.model_validate(supplier))
+
+
+@router.patch("/{supplier_id}/deactivate", response_model=APIResponse[SupplierOutput])
+async def deactivate_supplier(
+    supplier_id: UUID,
+    service: SupplierService = Depends(get_service),
+) -> APIResponse[SupplierOutput]:
+    supplier = await service.set_active(supplier_id, is_active=False)
+    return APIResponse(data=SupplierOutput.model_validate(supplier))
 
 
 @router.get(
