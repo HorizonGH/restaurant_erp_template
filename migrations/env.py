@@ -21,6 +21,8 @@ if config.config_file_name is not None:
 
 # Autogenerate only detects models that have been imported somewhere by the
 # time this module runs, so domain model modules must be imported here too.
+import app.modules.catalog.domain.models  # noqa: F401
+
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,

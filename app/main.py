@@ -4,6 +4,7 @@ from app.core.logging import configure_logging
 from app.core.settings import settings
 from app.core.shared.presentation.exception_handlers import register_exception_handlers
 from app.middlewares.logging_middleware import LoggingMiddleware
+from app.modules.catalog.presentation.router import router as catalog_router
 
 configure_logging(json_logs=settings.log_json, log_level=settings.log_level)
 
@@ -15,7 +16,9 @@ app = FastAPI(
 app.add_middleware(LoggingMiddleware)
 register_exception_handlers(app)
 
+app.include_router(catalog_router, prefix="/api/v1/catalog")
 
-@app.get("/")
-async def health():
-    return {"detail": "ok"}
+
+@app.get("/api/v1/health")
+async def health() -> dict:
+    return {"data": {"status": "ok"}}
