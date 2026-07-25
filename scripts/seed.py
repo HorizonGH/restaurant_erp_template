@@ -1,0 +1,592 @@
+"""
+Idempotent database seed for the Restaurant ERP template.
+
+Populates all current modules (catalog + inventory) with realistic data for a
+mid-size restaurant operation.
+
+Run:
+    uv run python -m scripts.seed
+    # or
+    uv run python scripts/seed.py
+
+Safe to run multiple times — existing records (matched by unique business keys)
+are skipped, not duplicated.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from datetime import date, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+# Make sure the project root is on sys.path when running as a script
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.logging import configure_logging
+from app.core.settings import settings
+from app.core.shared.infrastructure.database import async_session_factory
+from app.modules.catalog.domain.enums import UnitType
+from app.modules.catalog.domain.models import (
+    Category,
+    Ingredient,
+    Supplier,
+    SupplierIngredient,
+    UnitOfMeasure,
+)
+from app.modules.inventory.application.schemas import (
+    MovementAdjustmentInput,
+    MovementEntryInput,
+    MovementExitInput,
+)
+from app.modules.inventory.application.service import MovementService
+from app.modules.inventory.domain.enums import LocationType
+from app.modules.inventory.domain.models import Location
+
+configure_logging(json_logs=False, log_level="INFO")
+log = structlog.get_logger()
+
+TODAY = date.today()
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+async def get_or_create(session: AsyncSession, model, unique_field: str, unique_value, **kwargs):
+    """Fetch by unique_field; create with kwargs if absent. Returns (obj, created)."""
+    stmt = select(model).where(
+        getattr(model, unique_field) == unique_value,
+        model.is_deleted.is_(False),
+    )
+    result = await session.execute(stmt)
+    obj = result.scalar_one_or_none()
+    if obj is not None:
+        return obj, False
+    obj = model(**{unique_field: unique_value}, **kwargs)
+    session.add(obj)
+    await session.flush()
+    return obj, True
+
+
+async def get_or_create_link(
+    session: AsyncSession,
+    supplier_id,
+    ingredient_id,
+    supplier_sku: str | None,
+    unit_cost: Decimal | None,
+):
+    stmt = select(SupplierIngredient).where(
+        SupplierIngredient.supplier_id == supplier_id,
+        SupplierIngredient.ingredient_id == ingredient_id,
+        SupplierIngredient.is_deleted.is_(False),
+    )
+    result = await session.execute(stmt)
+    obj = result.scalar_one_or_none()
+    if obj is not None:
+        return obj, False
+    obj = SupplierIngredient(
+        supplier_id=supplier_id,
+        ingredient_id=ingredient_id,
+        supplier_sku=supplier_sku,
+        unit_cost=unit_cost,
+    )
+    session.add(obj)
+    await session.flush()
+    return obj, True
+
+
+# ---------------------------------------------------------------------------
+# catalog seed
+# ---------------------------------------------------------------------------
+
+async def seed_units(session: AsyncSession) -> dict[str, UnitOfMeasure]:
+    """Returns a dict keyed by abbreviation."""
+    units_data = [
+        # weight
+        dict(name="Kilogram",     abbreviation="kg",  unit_type=UnitType.weight, base_unit_id=None, conversion_factor=None),
+        dict(name="Gram",         abbreviation="g",   unit_type=UnitType.weight, base_unit_id=None, conversion_factor=None),
+        # volume
+        dict(name="Litre",        abbreviation="L",   unit_type=UnitType.volume, base_unit_id=None, conversion_factor=None),
+        dict(name="Millilitre",   abbreviation="mL",  unit_type=UnitType.volume, base_unit_id=None, conversion_factor=None),
+        # unit
+        dict(name="Unit",         abbreviation="u",   unit_type=UnitType.unit,   base_unit_id=None, conversion_factor=None),
+        dict(name="Dozen",        abbreviation="doz", unit_type=UnitType.unit,   base_unit_id=None, conversion_factor=None),
+        dict(name="Portion",      abbreviation="por", unit_type=UnitType.unit,   base_unit_id=None, conversion_factor=None),
+    ]
+
+    result: dict[str, UnitOfMeasure] = {}
+    for data in units_data:
+        abbr = data.pop("abbreviation")
+        obj, created = await get_or_create(session, UnitOfMeasure, "abbreviation", abbr, **data)
+        result[abbr] = obj
+        if created:
+            log.info("unit created", abbreviation=abbr)
+
+    # Link derived units now that base units have IDs
+    derivations = [
+        ("g",   "kg",  Decimal("0.001")),
+        ("mL",  "L",   Decimal("0.001")),
+        ("doz", "u",   Decimal("12")),
+    ]
+    for derived_abbr, base_abbr, factor in derivations:
+        derived = result[derived_abbr]
+        if derived.base_unit_id is None:
+            derived.base_unit_id = result[base_abbr].entity_id
+            derived.conversion_factor = factor
+            await session.flush()
+
+    return result
+
+
+async def seed_categories(session: AsyncSession) -> dict[str, Category]:
+    """Returns a dict keyed by name."""
+    top_level = [
+        dict(name="Meats",      description="Fresh and frozen meat products"),
+        dict(name="Vegetables", description="Fresh, frozen, and canned vegetables"),
+        dict(name="Dairy",      description="Milk, cheese, butter, cream"),
+        dict(name="Dry Goods",  description="Grains, flours, pasta, rice"),
+        dict(name="Beverages",  description="Soft drinks, juices, water"),
+        dict(name="Seafood",    description="Fresh and frozen seafood"),
+        dict(name="Condiments", description="Sauces, oils, vinegars, spices"),
+    ]
+
+    result: dict[str, Category] = {}
+    for data in top_level:
+        name = data["name"]
+        obj, created = await get_or_create(session, Category, "name", name, description=data["description"])
+        result[name] = obj
+        if created:
+            log.info("category created", name=name)
+
+    sub_categories = [
+        ("Beef",        "Meats",      "Beef cuts and minced beef"),
+        ("Poultry",     "Meats",      "Chicken, turkey, duck"),
+        ("Pork",        "Meats",      "Pork cuts and charcuterie"),
+        ("Leafy Greens","Vegetables", "Lettuce, spinach, arugula"),
+        ("Root Vegetables","Vegetables","Carrots, potatoes, onions"),
+        ("Cheese",      "Dairy",      "Soft and hard cheeses"),
+        ("Oils & Fats", "Condiments", "Olive oil, butter, cooking oils"),
+        ("Spices",      "Condiments", "Dried herbs and spices"),
+    ]
+
+    for name, parent_name, desc in sub_categories:
+        obj, created = await get_or_create(
+            session, Category, "name", name,
+            description=desc,
+            parent_id=result[parent_name].entity_id,
+        )
+        result[name] = obj
+        if created:
+            log.info("sub-category created", name=name, parent=parent_name)
+
+    return result
+
+
+async def seed_suppliers(session: AsyncSession) -> dict[str, Supplier]:
+    suppliers_data = [
+        dict(
+            name="Fresh Farms Co.",
+            contact_name="Maria González",
+            email="orders@freshfarms.com",
+            phone="+1-555-0101",
+            address="12 Harvest Road, Springfield",
+            tax_id="US-100001",
+        ),
+        dict(
+            name="Prime Meats Ltd.",
+            contact_name="Carlos Rodríguez",
+            email="sales@primeats.com",
+            phone="+1-555-0202",
+            address="45 Butcher Lane, Meatville",
+            tax_id="US-100002",
+        ),
+        dict(
+            name="Ocean Catch Seafood",
+            contact_name="Ana Martínez",
+            email="fresh@oceancatch.com",
+            phone="+1-555-0303",
+            address="1 Harbor Quay, Port City",
+            tax_id="US-100003",
+        ),
+        dict(
+            name="Global Dry Goods Inc.",
+            contact_name="James Lee",
+            email="supply@globaldry.com",
+            phone="+1-555-0404",
+            address="78 Warehouse Blvd, Trade City",
+            tax_id="US-100004",
+        ),
+    ]
+
+    result: dict[str, Supplier] = {}
+    for data in suppliers_data:
+        name = data["name"]
+        obj, created = await get_or_create(session, Supplier, "name", name, **{k: v for k, v in data.items() if k != "name"})
+        result[name] = obj
+        if created:
+            log.info("supplier created", name=name)
+
+    return result
+
+
+async def seed_ingredients(
+    session: AsyncSession,
+    categories: dict[str, Category],
+    units: dict[str, UnitOfMeasure],
+    suppliers: dict[str, Supplier],
+) -> dict[str, Ingredient]:
+    """
+    Each tuple: (sku, name, description, category_key, unit_abbr,
+                 reorder_point, reorder_qty, cost_per_unit, allergen_info,
+                 supplier_name, supplier_sku, supplier_cost)
+    """
+    ingredients_data = [
+        # Beef
+        ("BEEF-001", "Beef Tenderloin",    "Prime cut, 300-400g portions",     "Beef",           "kg",  "5",  "10",  "28.00", None,               "Prime Meats Ltd.", "BT-001", "25.00"),
+        ("BEEF-002", "Ground Beef 80/20",  "Regular grind, 1 kg packs",        "Beef",           "kg",  "10", "20",  "8.50",  None,               "Prime Meats Ltd.", "GB-001", "7.80"),
+        ("BEEF-003", "Beef Short Ribs",    "Bone-in, 500g portions",           "Beef",           "kg",  "4",  "8",   "14.00", None,               "Prime Meats Ltd.", "SR-001", "12.50"),
+        # Poultry
+        ("POL-001",  "Chicken Breast",     "Boneless, skinless",               "Poultry",        "kg",  "8",  "15",  "6.50",  None,               "Fresh Farms Co.", "CB-001", "5.90"),
+        ("POL-002",  "Chicken Thigh",      "Bone-in, skin-on",                 "Poultry",        "kg",  "6",  "12",  "4.50",  None,               "Fresh Farms Co.", "CT-001", "4.00"),
+        ("POL-003",  "Whole Duck",         "Approx. 2.5 kg each",              "Poultry",        "u",   "2",  "4",   "22.00", None,               "Prime Meats Ltd.", "WD-001", "20.00"),
+        # Pork
+        ("PORK-001", "Pork Belly",         "Skin-on, 1 kg slabs",              "Pork",           "kg",  "4",  "8",   "9.00",  None,               "Prime Meats Ltd.", "PB-001", "8.20"),
+        ("PORK-002", "Bacon Strips",       "Smoked, 500g packs",               "Pork",           "kg",  "3",  "6",   "11.00", None,               "Prime Meats Ltd.", "BAC-001","10.00"),
+        # Vegetables
+        ("VEG-001",  "Tomato",             "Ripe Roma tomatoes",               "Root Vegetables","kg",  "5",  "20",  "1.50",  None,               "Fresh Farms Co.", "TOM-001","1.20"),
+        ("VEG-002",  "Yellow Onion",       "Medium-sized",                     "Root Vegetables","kg",  "5",  "15",  "0.80",  None,               "Fresh Farms Co.", "ONI-001","0.70"),
+        ("VEG-003",  "Carrot",             "Whole, unpeeled",                  "Root Vegetables","kg",  "4",  "10",  "0.90",  None,               "Fresh Farms Co.", "CAR-001","0.75"),
+        ("VEG-004",  "Potato",             "Russet, 1 kg bag",                 "Root Vegetables","kg",  "8",  "25",  "0.70",  None,               "Fresh Farms Co.", "POT-001","0.60"),
+        ("VEG-005",  "Garlic",             "Whole bulbs",                      "Root Vegetables","kg",  "2",  "5",   "4.00",  None,               "Fresh Farms Co.", "GAR-001","3.50"),
+        ("VEG-006",  "Spinach",            "Baby spinach, washed",             "Leafy Greens",   "kg",  "2",  "4",   "3.50",  None,               "Fresh Farms Co.", "SPI-001","3.00"),
+        ("VEG-007",  "Iceberg Lettuce",    "Whole head",                       "Leafy Greens",   "u",   "5",  "10",  "1.20",  None,               "Fresh Farms Co.", "LET-001","1.00"),
+        ("VEG-008",  "Bell Pepper Red",    "Large, whole",                     "Root Vegetables","kg",  "3",  "8",   "2.80",  None,               "Fresh Farms Co.", "BPR-001","2.40"),
+        # Dairy
+        ("DAI-001",  "Whole Milk",         "Pasteurised, 1L carton",           "Dairy",          "L",   "10", "20",  "1.20",  "milk",             "Fresh Farms Co.", "MIL-001","1.00"),
+        ("DAI-002",  "Heavy Cream",        "35% fat, 500mL",                   "Dairy",          "L",   "4",  "8",   "3.50",  "milk",             "Fresh Farms Co.", "CRE-001","3.00"),
+        ("DAI-003",  "Butter Unsalted",    "250g blocks",                      "Dairy",          "kg",  "3",  "6",   "7.00",  "milk",             "Fresh Farms Co.", "BUT-001","6.20"),
+        ("DAI-004",  "Parmesan Cheese",    "Aged, block",                      "Cheese",         "kg",  "1",  "2",   "22.00", "milk",             "Fresh Farms Co.", "PAR-001","20.00"),
+        ("DAI-005",  "Mozzarella Fresh",   "125g balls in brine",              "Cheese",         "kg",  "2",  "4",   "12.00", "milk",             "Fresh Farms Co.", "MOZ-001","11.00"),
+        # Dry goods
+        ("DRY-001",  "All-Purpose Flour",  "Unbleached, 5 kg bag",             "Dry Goods",      "kg",  "10", "25",  "1.10",  "gluten",           "Global Dry Goods Inc.", "APF-001","0.95"),
+        ("DRY-002",  "Arborio Rice",       "Short grain, 1 kg pack",           "Dry Goods",      "kg",  "4",  "10",  "2.80",  None,               "Global Dry Goods Inc.", "RIC-001","2.40"),
+        ("DRY-003",  "Pasta Penne",        "500g pack, bronze die",            "Dry Goods",      "kg",  "4",  "10",  "2.20",  "gluten",           "Global Dry Goods Inc.", "PEN-001","1.90"),
+        ("DRY-004",  "Breadcrumbs",        "Plain, fine",                      "Dry Goods",      "kg",  "3",  "6",   "1.80",  "gluten",           "Global Dry Goods Inc.", "BRC-001","1.50"),
+        ("DRY-005",  "Olive Oil Extra V.", "Cold pressed, 1L bottle",          "Oils & Fats",    "L",   "3",  "6",   "8.50",  None,               "Global Dry Goods Inc.", "OLV-001","7.80"),
+        ("DRY-006",  "Chicken Stock",      "1L carton, low sodium",            "Dry Goods",      "L",   "5",  "10",  "2.50",  None,               "Global Dry Goods Inc.", "CST-001","2.20"),
+        # Spices
+        ("SPC-001",  "Black Pepper Ground","100g tin",                         "Spices",         "g",   "50", "200", "0.04",  None,               "Global Dry Goods Inc.", "BPG-001","0.03"),
+        ("SPC-002",  "Sea Salt Fine",      "1 kg bag",                         "Spices",         "kg",  "1",  "3",   "1.50",  None,               "Global Dry Goods Inc.", "SSL-001","1.20"),
+        ("SPC-003",  "Paprika Smoked",     "75g tin",                          "Spices",         "g",   "30", "100", "0.05",  None,               "Global Dry Goods Inc.", "PAP-001","0.04"),
+        ("SPC-004",  "Rosemary Dried",     "25g tin",                          "Spices",         "g",   "20", "80",  "0.08",  None,               "Global Dry Goods Inc.", "ROS-001","0.07"),
+        # Seafood
+        ("SEA-001",  "Atlantic Salmon",    "Fillet, skin-on, 200g portions",   "Seafood",        "kg",  "4",  "8",   "18.00", "fish",             "Ocean Catch Seafood", "SAL-001","16.50"),
+        ("SEA-002",  "Tiger Prawns",       "16/20 count, IQF",                 "Seafood",        "kg",  "3",  "6",   "24.00", "shellfish",        "Ocean Catch Seafood", "PRW-001","22.00"),
+        ("SEA-003",  "Tuna Loin",          "Sashimi grade",                    "Seafood",        "kg",  "2",  "4",   "32.00", "fish",             "Ocean Catch Seafood", "TUN-001","29.00"),
+        # Beverages
+        ("BEV-001",  "Sparkling Water",    "330mL cans, 24-pack",              "Beverages",      "u",   "24", "48",  "0.50",  None,               "Global Dry Goods Inc.", "SPW-001","0.40"),
+        ("BEV-002",  "Orange Juice",       "100% pure, 1L carton",             "Beverages",      "L",   "4",  "10",  "2.20",  None,               "Fresh Farms Co.", "OJ-001", "1.90"),
+    ]
+
+    result: dict[str, Ingredient] = {}
+    for row in ingredients_data:
+        sku, name, desc, cat_key, unit_abbr, rp, rq, cpu, allergen, sup_name, sup_sku, sup_cost = row
+        obj, created = await get_or_create(
+            session, Ingredient, "sku", sku,
+            name=name,
+            description=desc,
+            category_id=categories[cat_key].entity_id,
+            unit_of_measure_id=units[unit_abbr].entity_id,
+            reorder_point=Decimal(rp),
+            reorder_quantity=Decimal(rq),
+            cost_per_unit=Decimal(cpu),
+            allergen_info=allergen,
+            is_active=True,
+        )
+        result[sku] = obj
+        if created:
+            log.info("ingredient created", sku=sku, name=name)
+
+        # supplier link
+        _, link_created = await get_or_create_link(
+            session,
+            supplier_id=suppliers[sup_name].entity_id,
+            ingredient_id=obj.entity_id,
+            supplier_sku=sup_sku,
+            unit_cost=Decimal(sup_cost),
+        )
+        if link_created:
+            log.info("supplier link created", sku=sku, supplier=sup_name)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# inventory seed
+# ---------------------------------------------------------------------------
+
+async def seed_locations(session: AsyncSession) -> dict[str, Location]:
+    locations_data = [
+        dict(name="Main Warehouse",      code="WH-01", location_type=LocationType.warehouse, description="Primary dry goods and non-perishable storage"),
+        dict(name="Walk-in Fridge",      code="FRG-01",location_type=LocationType.fridge,    description="Refrigerated storage 2–5°C"),
+        dict(name="Walk-in Freezer",     code="FRZ-01",location_type=LocationType.freezer,   description="Deep freeze storage −18°C"),
+        dict(name="Kitchen Prep Station",code="PROD-01",location_type=LocationType.production,description="Active kitchen prep area"),
+        dict(name="Bar Storage",         code="BAR-01", location_type=LocationType.bar,       description="Bar spirits and beverage stock"),
+    ]
+
+    result: dict[str, Location] = {}
+    for data in locations_data:
+        code = data["code"]
+        obj, created = await get_or_create(session, Location, "code", code, **{k: v for k, v in data.items() if k != "code"})
+        result[code] = obj
+        if created:
+            log.info("location created", code=code, name=data["name"])
+
+    return result
+
+
+async def seed_inventory_movements(
+    session: AsyncSession,
+    ingredients: dict[str, Ingredient],
+    locations: dict[str, Location],
+) -> None:
+    """
+    Seed realistic stock movements for a typical week of restaurant operations.
+    Only creates movements for ingredient+location pairs that have no kardex
+    entries yet — fully idempotent.
+    """
+    from app.modules.inventory.infrastructure.repository import KardexRepository
+    kardex_repo = KardexRepository(session)
+    svc = MovementService(session)
+
+    async def has_kardex(ingredient_id, location_id) -> bool:
+        bal = await kardex_repo.get_last_balance(ingredient_id, location_id)
+        return bal > Decimal("0")
+
+    wh   = locations["WH-01"].entity_id
+    frdg = locations["FRG-01"].entity_id
+    frzr = locations["FRZ-01"].entity_id
+    bar  = locations["BAR-01"].entity_id
+
+    # ------------------------------------------------------------------
+    # WAREHOUSE — dry goods, spices, beverages
+    # ------------------------------------------------------------------
+    warehouse_entries = [
+        # (sku, qty, cost, batch, lot, received, expiry)
+        ("DRY-001", "25.00",  "1.10",  "WH-APF-001", "L2025-07A", TODAY - timedelta(days=10), TODAY + timedelta(days=365)),
+        ("DRY-002", "20.00",  "2.80",  "WH-RIC-001", "L2025-07B", TODAY - timedelta(days=10), None),
+        ("DRY-003", "15.00",  "2.20",  "WH-PEN-001", "L2025-07C", TODAY - timedelta(days=10), TODAY + timedelta(days=180)),
+        ("DRY-004", "8.00",   "1.80",  "WH-BRC-001", "L2025-07D", TODAY - timedelta(days=10), TODAY + timedelta(days=90)),
+        ("DRY-005", "12.00",  "8.50",  "WH-OLV-001", "L2025-07E", TODAY - timedelta(days=10), TODAY + timedelta(days=540)),
+        ("DRY-006", "20.00",  "2.50",  "WH-CST-001", "L2025-07F", TODAY - timedelta(days=10), TODAY + timedelta(days=60)),
+        ("SPC-001", "500.00", "0.04",  "WH-BPG-001", "L2025-07G", TODAY - timedelta(days=15), TODAY + timedelta(days=730)),
+        ("SPC-002", "10.00",  "1.50",  "WH-SSL-001", "L2025-07H", TODAY - timedelta(days=15), None),
+        ("SPC-003", "300.00", "0.05",  "WH-PAP-001", "L2025-07I", TODAY - timedelta(days=15), TODAY + timedelta(days=730)),
+        ("SPC-004", "200.00", "0.08",  "WH-ROS-001", "L2025-07J", TODAY - timedelta(days=15), TODAY + timedelta(days=730)),
+        ("BEV-001", "96.00",  "0.50",  "WH-SPW-001", "L2025-07K", TODAY - timedelta(days=5),  TODAY + timedelta(days=360)),
+    ]
+
+    for sku, qty, cost, batch, lot, recv, exp in warehouse_entries:
+        ing = ingredients[sku]
+        if await has_kardex(ing.entity_id, wh):
+            continue
+        await svc.record_entry(MovementEntryInput(
+            ingredient_id=ing.entity_id,
+            location_id=wh,
+            quantity=Decimal(qty),
+            unit_cost=Decimal(cost),
+            batch_number=batch,
+            lot_number=lot,
+            received_date=recv,
+            expiry_date=exp,
+        ))
+        log.info("entry recorded", sku=sku, location="WH-01", qty=qty)
+
+    # ------------------------------------------------------------------
+    # FRIDGE — dairy, produce, beverages, fresh seafood
+    # ------------------------------------------------------------------
+    fridge_entries = [
+        ("DAI-001", "30.00",  "1.20",  "FRG-MIL-001", "L2025-07A", TODAY - timedelta(days=3),  TODAY + timedelta(days=7)),
+        ("DAI-002", "8.00",   "3.50",  "FRG-CRE-001", "L2025-07B", TODAY - timedelta(days=3),  TODAY + timedelta(days=5)),
+        ("DAI-003", "5.00",   "7.00",  "FRG-BUT-001", "L2025-07C", TODAY - timedelta(days=3),  TODAY + timedelta(days=30)),
+        ("DAI-004", "3.00",   "22.00", "FRG-PAR-001", "L2025-07D", TODAY - timedelta(days=5),  TODAY + timedelta(days=60)),
+        ("DAI-005", "4.00",   "12.00", "FRG-MOZ-001", "L2025-07E", TODAY - timedelta(days=2),  TODAY + timedelta(days=5)),
+        ("VEG-001", "15.00",  "1.50",  "FRG-TOM-001", "L2025-07F", TODAY - timedelta(days=2),  TODAY + timedelta(days=5)),
+        ("VEG-002", "12.00",  "0.80",  "FRG-ONI-001", "L2025-07G", TODAY - timedelta(days=5),  TODAY + timedelta(days=14)),
+        ("VEG-003", "10.00",  "0.90",  "FRG-CAR-001", "L2025-07H", TODAY - timedelta(days=5),  TODAY + timedelta(days=14)),
+        ("VEG-004", "20.00",  "0.70",  "FRG-POT-001", "L2025-07I", TODAY - timedelta(days=7),  TODAY + timedelta(days=21)),
+        ("VEG-005", "4.00",   "4.00",  "FRG-GAR-001", "L2025-07J", TODAY - timedelta(days=7),  TODAY + timedelta(days=30)),
+        ("VEG-006", "5.00",   "3.50",  "FRG-SPI-001", "L2025-07K", TODAY - timedelta(days=1),  TODAY + timedelta(days=4)),
+        ("VEG-007", "10.00",  "1.20",  "FRG-LET-001", "L2025-07L", TODAY - timedelta(days=1),  TODAY + timedelta(days=5)),
+        ("VEG-008", "6.00",   "2.80",  "FRG-BPR-001", "L2025-07M", TODAY - timedelta(days=2),  TODAY + timedelta(days=7)),
+        ("POL-001", "20.00",  "6.50",  "FRG-CB-001",  "L2025-07N", TODAY - timedelta(days=2),  TODAY + timedelta(days=3)),
+        ("POL-002", "15.00",  "4.50",  "FRG-CT-001",  "L2025-07O", TODAY - timedelta(days=2),  TODAY + timedelta(days=3)),
+        ("BEV-002", "12.00",  "2.20",  "FRG-OJ-001",  "L2025-07P", TODAY - timedelta(days=2),  TODAY + timedelta(days=7)),
+        ("SEA-001", "8.00",   "18.00", "FRG-SAL-001", "L2025-07Q", TODAY - timedelta(days=1),  TODAY + timedelta(days=2)),
+        ("SEA-002", "6.00",   "24.00", "FRG-PRW-001", "L2025-07R", TODAY - timedelta(days=1),  TODAY + timedelta(days=2)),
+        ("SEA-003", "3.00",   "32.00", "FRG-TUN-001", "L2025-07S", TODAY,                       TODAY + timedelta(days=1)),
+    ]
+
+    for sku, qty, cost, batch, lot, recv, exp in fridge_entries:
+        ing = ingredients[sku]
+        if await has_kardex(ing.entity_id, frdg):
+            continue
+        await svc.record_entry(MovementEntryInput(
+            ingredient_id=ing.entity_id,
+            location_id=frdg,
+            quantity=Decimal(qty),
+            unit_cost=Decimal(cost),
+            batch_number=batch,
+            lot_number=lot,
+            received_date=recv,
+            expiry_date=exp,
+        ))
+        log.info("entry recorded", sku=sku, location="FRG-01", qty=qty)
+
+    # ------------------------------------------------------------------
+    # FREEZER — meats, frozen seafood, frozen poultry
+    # ------------------------------------------------------------------
+    freezer_entries = [
+        ("BEEF-001", "15.00", "28.00", "FRZ-BT-001",  "L2025-07A", TODAY - timedelta(days=7),  TODAY + timedelta(days=180)),
+        ("BEEF-002", "25.00", "8.50",  "FRZ-GB-001",  "L2025-07B", TODAY - timedelta(days=7),  TODAY + timedelta(days=180)),
+        ("BEEF-003", "10.00", "14.00", "FRZ-SR-001",  "L2025-07C", TODAY - timedelta(days=7),  TODAY + timedelta(days=180)),
+        ("PORK-001", "12.00", "9.00",  "FRZ-PB-001",  "L2025-07D", TODAY - timedelta(days=5),  TODAY + timedelta(days=120)),
+        ("PORK-002", "8.00",  "11.00", "FRZ-BAC-001", "L2025-07E", TODAY - timedelta(days=5),  TODAY + timedelta(days=120)),
+        ("POL-003",  "6.00",  "22.00", "FRZ-DUK-001", "L2025-07F", TODAY - timedelta(days=5),  TODAY + timedelta(days=120)),
+        ("SEA-002",  "10.00", "24.00", "FRZ-PRW-001", "L2025-07G", TODAY - timedelta(days=10), TODAY + timedelta(days=365)),
+    ]
+
+    for sku, qty, cost, batch, lot, recv, exp in freezer_entries:
+        ing = ingredients[sku]
+        if await has_kardex(ing.entity_id, frzr):
+            continue
+        await svc.record_entry(MovementEntryInput(
+            ingredient_id=ing.entity_id,
+            location_id=frzr,
+            quantity=Decimal(qty),
+            unit_cost=Decimal(cost),
+            batch_number=batch,
+            lot_number=lot,
+            received_date=recv,
+            expiry_date=exp,
+        ))
+        log.info("entry recorded", sku=sku, location="FRZ-01", qty=qty)
+
+    # ------------------------------------------------------------------
+    # BAR — beverages
+    # ------------------------------------------------------------------
+    bar_entries = [
+        ("BEV-001", "48.00", "0.50", "BAR-SPW-001", "L2025-07A", TODAY - timedelta(days=3), TODAY + timedelta(days=360)),
+        ("BEV-002", "8.00",  "2.20", "BAR-OJ-001",  "L2025-07B", TODAY - timedelta(days=3), TODAY + timedelta(days=7)),
+    ]
+
+    for sku, qty, cost, batch, lot, recv, exp in bar_entries:
+        ing = ingredients[sku]
+        if await has_kardex(ing.entity_id, bar):
+            continue
+        await svc.record_entry(MovementEntryInput(
+            ingredient_id=ing.entity_id,
+            location_id=bar,
+            quantity=Decimal(qty),
+            unit_cost=Decimal(cost),
+            batch_number=batch,
+            lot_number=lot,
+            received_date=recv,
+            expiry_date=exp,
+        ))
+        log.info("entry recorded", sku=sku, location="BAR-01", qty=qty)
+
+    # ------------------------------------------------------------------
+    # Simulate daily kitchen consumption (exits from fridge)
+    # ------------------------------------------------------------------
+    daily_usage = [
+        # (sku, qty, reason)
+        ("POL-001", "4.00",  "Lunch and dinner service"),
+        ("POL-002", "3.00",  "Lunch service"),
+        ("VEG-001", "3.00",  "Sauce and garnish"),
+        ("VEG-002", "2.00",  "Mise en place"),
+        ("VEG-006", "1.00",  "Salad station"),
+        ("DAI-003", "0.50",  "Sauce work"),
+        ("DAI-001", "4.00",  "Baking and sauces"),
+        ("SEA-001", "2.00",  "Dinner service"),
+    ]
+
+    for sku, qty, reason in daily_usage:
+        ing = ingredients[sku]
+        # only add exits if there was a fridge entry (balance > qty being exited)
+        bal = await kardex_repo.get_last_balance(ing.entity_id, frdg)
+        if bal <= Decimal("0"):
+            continue
+        # skip if we've already done this exit (balance < original entry)
+        # Use a simple heuristic: if balance still equals entry quantity, create the exit
+        entry_qty_map = {
+            "POL-001": Decimal("20.00"), "POL-002": Decimal("15.00"),
+            "VEG-001": Decimal("15.00"), "VEG-002": Decimal("12.00"),
+            "VEG-006": Decimal("5.00"),  "DAI-003": Decimal("5.00"),
+            "DAI-001": Decimal("30.00"), "SEA-001": Decimal("8.00"),
+        }
+        if bal < entry_qty_map.get(sku, Decimal("9999")):
+            log.info("exit already applied, skipping", sku=sku)
+            continue
+        await svc.record_exit(MovementExitInput(
+            ingredient_id=ing.entity_id,
+            location_id=frdg,
+            quantity=Decimal(qty),
+            reason=reason,
+            notes="Seeded daily kitchen consumption",
+        ))
+        log.info("exit recorded", sku=sku, location="FRG-01", qty=qty)
+
+    # ------------------------------------------------------------------
+    # One adjustment — spinach spoilage during fridge check
+    # ------------------------------------------------------------------
+    spinach = ingredients["VEG-006"]
+    spinach_bal = await kardex_repo.get_last_balance(spinach.entity_id, frdg)
+    # apply only if adjustment hasn't happened yet (balance still at post-exit level)
+    post_exit_expected = Decimal("4.00")  # 5 entry − 1 exit
+    if spinach_bal >= post_exit_expected:
+        await svc.record_adjustment(MovementAdjustmentInput(
+            ingredient_id=spinach.entity_id,
+            location_id=frdg,
+            quantity_delta=Decimal("-0.50"),
+            reason="Spoilage found during morning fridge check",
+            notes="Two bags partially wilted, discarded",
+        ))
+        log.info("adjustment recorded", sku="VEG-006", delta="-0.50")
+
+
+# ---------------------------------------------------------------------------
+# main entry point
+# ---------------------------------------------------------------------------
+
+async def run_seed() -> None:
+    log.info("seed started", database=settings.database_url.split("@")[-1])
+
+    async with async_session_factory() as session:
+        async with session.begin():
+            # Catalog
+            log.info("--- seeding catalog ---")
+            units      = await seed_units(session)
+            categories = await seed_categories(session)
+            suppliers  = await seed_suppliers(session)
+            ingredients = await seed_ingredients(session, categories, units, suppliers)
+
+            # Inventory
+            log.info("--- seeding inventory locations ---")
+            locations  = await seed_locations(session)
+
+        # Movements need their own commits (MovementService commits internally)
+        log.info("--- seeding inventory movements ---")
+        await seed_inventory_movements(session, ingredients, locations)
+
+    log.info("seed complete")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_seed())
