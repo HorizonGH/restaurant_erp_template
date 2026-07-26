@@ -77,6 +77,19 @@ from app.modules.production.application.schemas import (
 )
 from app.modules.production.application.service import RecipeService, ProductionOrderService
 from app.modules.production.domain.models import Recipe, ProductionOrder as ProdOrder
+from app.modules.sales.application.schemas import (
+    SalesOrderCreateInput,
+    SalesOrderLineCreateInput,
+)
+from app.modules.sales.application.service import SalesOrderService
+from app.modules.sales.domain.enums import SalesChannel
+from app.modules.sales.domain.models import SalesOrder
+from app.modules.waste.application.schemas import (
+    WasteCategoryCreateInput,
+    WasteRecordCreateInput,
+)
+from app.modules.waste.application.service import WasteCategoryService, WasteRecordService
+from app.modules.waste.domain.models import WasteCategory
 
 configure_logging(json_logs=False, log_level="INFO")
 log = structlog.get_logger()
@@ -1420,6 +1433,319 @@ async def seed_production(
 
 
 # ---------------------------------------------------------------------------
+# waste categories seed
+# ---------------------------------------------------------------------------
+
+async def seed_waste_categories(session: AsyncSession) -> dict[str, WasteCategory]:
+    """
+    Seeds standard waste categories.  Idempotent — skips existing names.
+    """
+    svc = WasteCategoryService(session)
+    category_defs = [
+        ("Spoilage",    "Items that have expired or gone off before use"),
+        ("Trim Waste",  "Unavoidable trim and prep waste (peels, bones, fat)"),
+        ("Over-Prep",   "Items prepared in excess that could not be used"),
+        ("Breakage",    "Damaged or dropped items"),
+        ("Expired",     "Items discarded upon or after their expiry date"),
+    ]
+    result: dict[str, WasteCategory] = {}
+    for name, description in category_defs:
+        existing = await svc.repo.get_by_name(name)
+        if existing is not None:
+            result[name] = existing
+            log.info("waste category already exists, skipping", name=name)
+        else:
+            cat = await svc.create(WasteCategoryCreateInput(name=name, description=description))
+            result[name] = cat
+            log.info("waste category seeded", name=name)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# waste records seed
+# ---------------------------------------------------------------------------
+
+async def _waste_record_exists(session: AsyncSession, ingredient_id, location_id, waste_date: date) -> bool:
+    from app.modules.waste.domain.models import WasteRecord as WR
+    result = await session.execute(
+        select(WR).where(
+            WR.ingredient_id == ingredient_id,
+            WR.location_id == location_id,
+            WR.waste_date == waste_date,
+            WR.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def seed_waste(
+    session: AsyncSession,
+    ingredients: dict[str, Ingredient],
+    locations: dict[str, Location],
+    waste_categories: dict[str, WasteCategory],
+) -> None:
+    """
+    Seeds realistic waste records using FRG-01 produce and FRZ-01 proteins.
+
+    Available stock after inventory seeding and daily exits:
+      FRG-01: VEG-006 ~3.5 kg, VEG-001 ~12 kg, DAI-002 8 L, POL-001 ~16 kg
+      FRZ-01: PORK-002 8 kg
+
+    Waste records:
+      1. Spoilage — spinach (VEG-006) at FRG-01, 0.50 kg — near-expiry bags
+      2. Trim Waste — tomatoes (VEG-001) at FRG-01, 0.80 kg — prep trim
+      3. Over-Prep — chicken thigh (POL-002) at FRG-01, 1.00 kg — over-prepped
+      4. Expired — heavy cream (DAI-002) at FRG-01, 0.50 L — past use-by
+      5. Breakage — pork belly (PORK-002) at FRZ-01, 0.30 kg — dropped in freezer
+    """
+    svc = WasteRecordService(session)
+    frdg = locations["FRG-01"].entity_id
+    frzr = locations["FRZ-01"].entity_id
+
+    waste_defs = [
+        # (sku, location_id, category_name, qty, waste_date, reason, notes)
+        (
+            "VEG-006", frdg, "Spoilage", "0.50",
+            TODAY - timedelta(days=1),
+            "Near-expiry spinach discarded",
+            "Three bags with yellowing leaves removed from morning mise en place",
+        ),
+        (
+            "VEG-001", frdg, "Trim Waste", "0.80",
+            TODAY - timedelta(days=1),
+            "Tomato prep trim",
+            "Core, skin and bruised sections removed during sauce prep",
+        ),
+        (
+            "POL-002", frdg, "Over-Prep", "1.00",
+            TODAY,
+            "Excess portioned chicken thighs",
+            "Over-prepped for lunch service; no more orders expected before expiry",
+        ),
+        (
+            "DAI-002", frdg, "Expired", "0.50",
+            TODAY,
+            "Heavy cream past use-by date",
+            "Container opened yesterday; remaining quantity discarded per HACCP protocol",
+        ),
+        (
+            "PORK-002", frzr, "Breakage", "0.30",
+            TODAY,
+            "Pork belly damaged when dropped from freezer shelf",
+            "Package split on impact; contamination risk — discarded",
+        ),
+    ]
+
+    for sku, loc_id, cat_name, qty, w_date, reason, notes in waste_defs:
+        ing = ingredients[sku]
+        if await _waste_record_exists(session, ing.entity_id, loc_id, w_date):
+            log.info("waste record already exists, skipping", sku=sku, date=str(w_date))
+            continue
+        await svc.record_waste(
+            WasteRecordCreateInput(
+                ingredient_id=ing.entity_id,
+                location_id=loc_id,
+                waste_category_id=waste_categories[cat_name].entity_id,
+                quantity=Decimal(qty),
+                waste_date=w_date,
+                reason=reason,
+                notes=notes,
+            )
+        )
+        log.info("waste record seeded", sku=sku, category=cat_name, qty=qty)
+
+
+# ---------------------------------------------------------------------------
+# sales orders seed
+# ---------------------------------------------------------------------------
+
+async def _sales_order_exists(session: AsyncSession, order_number: str) -> bool:
+    result = await session.execute(
+        select(SalesOrder).where(
+            SalesOrder.order_number == order_number,
+            SalesOrder.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def seed_sales(
+    session: AsyncSession,
+    ingredients: dict[str, Ingredient],
+    locations: dict[str, Location],
+) -> None:
+    """
+    Seeds four sales orders covering the full lifecycle:
+
+      SO-SEED-001 — dine-in, DELIVERED  (FRG-01, chicken + tomatoes)
+      SO-SEED-002 — delivery, DELIVERED  (FRZ-01, beef + pork)
+      SO-SEED-003 — takeaway, IN_PREPARATION (FRG-01, poultry + veg)
+      SO-SEED-004 — online, CANCELLED   (BAR-01, beverages — cancelled before delivery)
+
+    Stock consumed by deliveries:
+      FRG-01: POL-001 1.50 kg, VEG-001 0.50 kg
+      FRZ-01: BEEF-001 2.00 kg, PORK-001 1.50 kg
+    """
+    svc = SalesOrderService(session)
+    frdg = locations["FRG-01"].entity_id
+    frzr = locations["FRZ-01"].entity_id
+    bar  = locations["BAR-01"].entity_id
+
+    # ------------------------------------------------------------------
+    # SO-SEED-001 — Dine-in table, fully delivered
+    # ------------------------------------------------------------------
+    SO1_NUMBER = "SO-SEED-001"
+    if not await _sales_order_exists(session, SO1_NUMBER):
+        o1 = await svc.create(
+            SalesOrderCreateInput(
+                source_location_id=frdg,
+                channel=SalesChannel.dine_in,
+                table_reference="T-04",
+                notes="[SEED] Lunch service, table 4",
+            )
+        )
+        o1 = await svc.repo.update(o1, order_number=SO1_NUMBER)
+        await session.commit()
+
+        await svc.add_line(
+            o1.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["POL-001"].entity_id,
+                quantity=Decimal("1.50"),
+                unit_price=Decimal("18.00"),
+            ),
+        )
+        await svc.add_line(
+            o1.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["VEG-001"].entity_id,
+                quantity=Decimal("0.50"),
+                unit_price=Decimal("4.50"),
+            ),
+        )
+        o1 = await svc.confirm(o1.entity_id)
+        o1 = await svc.start_preparation(o1.entity_id)
+        o1 = await svc.mark_ready(o1.entity_id)
+        await svc.deliver(o1.entity_id)
+        log.info("sales order seeded (delivered)", order_number=SO1_NUMBER)
+    else:
+        log.info("sales order already exists, skipping", order_number=SO1_NUMBER)
+
+    # ------------------------------------------------------------------
+    # SO-SEED-002 — Delivery order, fully delivered
+    # ------------------------------------------------------------------
+    SO2_NUMBER = "SO-SEED-002"
+    if not await _sales_order_exists(session, SO2_NUMBER):
+        o2 = await svc.create(
+            SalesOrderCreateInput(
+                source_location_id=frzr,
+                channel=SalesChannel.delivery,
+                notes="[SEED] Evening delivery order",
+            )
+        )
+        o2 = await svc.repo.update(o2, order_number=SO2_NUMBER)
+        await session.commit()
+
+        await svc.add_line(
+            o2.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["BEEF-001"].entity_id,
+                quantity=Decimal("2.00"),
+                unit_price=Decimal("55.00"),
+            ),
+        )
+        await svc.add_line(
+            o2.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["PORK-001"].entity_id,
+                quantity=Decimal("1.50"),
+                unit_price=Decimal("22.00"),
+            ),
+        )
+        o2 = await svc.confirm(o2.entity_id)
+        o2 = await svc.start_preparation(o2.entity_id)
+        o2 = await svc.mark_ready(o2.entity_id)
+        await svc.deliver(o2.entity_id)
+        log.info("sales order seeded (delivered)", order_number=SO2_NUMBER)
+    else:
+        log.info("sales order already exists, skipping", order_number=SO2_NUMBER)
+
+    # ------------------------------------------------------------------
+    # SO-SEED-003 — Takeaway, in preparation
+    # ------------------------------------------------------------------
+    SO3_NUMBER = "SO-SEED-003"
+    if not await _sales_order_exists(session, SO3_NUMBER):
+        o3 = await svc.create(
+            SalesOrderCreateInput(
+                source_location_id=frdg,
+                channel=SalesChannel.takeaway,
+                notes="[SEED] Takeaway pick-up order",
+            )
+        )
+        o3 = await svc.repo.update(o3, order_number=SO3_NUMBER)
+        await session.commit()
+
+        await svc.add_line(
+            o3.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["POL-002"].entity_id,
+                quantity=Decimal("1.00"),
+                unit_price=Decimal("14.00"),
+            ),
+        )
+        await svc.add_line(
+            o3.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["VEG-002"].entity_id,
+                quantity=Decimal("0.30"),
+                unit_price=Decimal("2.50"),
+            ),
+        )
+        o3 = await svc.confirm(o3.entity_id)
+        await svc.start_preparation(o3.entity_id)
+        log.info("sales order seeded (in_preparation)", order_number=SO3_NUMBER)
+    else:
+        log.info("sales order already exists, skipping", order_number=SO3_NUMBER)
+
+    # ------------------------------------------------------------------
+    # SO-SEED-004 — Online bar order, cancelled before delivery
+    # ------------------------------------------------------------------
+    SO4_NUMBER = "SO-SEED-004"
+    if not await _sales_order_exists(session, SO4_NUMBER):
+        o4 = await svc.create(
+            SalesOrderCreateInput(
+                source_location_id=bar,
+                channel=SalesChannel.online,
+                notes="[SEED] Online drinks order — customer cancelled",
+            )
+        )
+        o4 = await svc.repo.update(o4, order_number=SO4_NUMBER)
+        await session.commit()
+
+        await svc.add_line(
+            o4.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["BEV-001"].entity_id,
+                quantity=Decimal("4.00"),
+                unit_price=Decimal("3.50"),
+            ),
+        )
+        await svc.add_line(
+            o4.entity_id,
+            SalesOrderLineCreateInput(
+                ingredient_id=ingredients["BEV-002"].entity_id,
+                quantity=Decimal("1.00"),
+                unit_price=Decimal("5.00"),
+            ),
+        )
+        o4 = await svc.confirm(o4.entity_id)
+        await svc.cancel(o4.entity_id)
+        log.info("sales order seeded (cancelled)", order_number=SO4_NUMBER)
+    else:
+        log.info("sales order already exists, skipping", order_number=SO4_NUMBER)
+
+
+# ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
 
@@ -1458,6 +1784,18 @@ async def run_seed() -> None:
         # Production (RecipeService, ProductionOrderService commit internally)
         log.info("--- seeding production ---")
         await seed_production(session, ingredients, locations, units)
+
+        # Waste categories (WasteCategoryService commits internally)
+        log.info("--- seeding waste categories ---")
+        waste_categories = await seed_waste_categories(session)
+
+        # Waste records (WasteRecordService commits internally)
+        log.info("--- seeding waste records ---")
+        await seed_waste(session, ingredients, locations, waste_categories)
+
+        # Sales orders (SalesOrderService commits internally)
+        log.info("--- seeding sales orders ---")
+        await seed_sales(session, ingredients, locations)
 
     log.info("seed complete")
 

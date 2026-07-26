@@ -43,7 +43,7 @@ async def select_ingredients(
 
 @router.get("/", response_model=APIResponse[Page[IngredientOutput]])
 async def list_ingredients(
-    params: Annotated[PageParams, Query()],
+    params: Annotated[PageParams, Depends()],
     name: str | None = Query(default=None),
     sku: str | None = Query(default=None),
     category_id: UUID | None = Query(default=None),

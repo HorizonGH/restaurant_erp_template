@@ -32,7 +32,7 @@ def get_service(
 
 @router.get("/", response_model=APIResponse[Page[ProductionOrderOutput]])
 async def list_orders(
-    params: Annotated[PageParams, Query()],
+    params: Annotated[PageParams, Depends()],
     recipe_id: UUID | None = Query(default=None),
     source_location_id: UUID | None = Query(default=None),
     status: str | None = Query(default=None),
