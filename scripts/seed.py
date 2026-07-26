@@ -56,6 +56,19 @@ from app.modules.transfers.application.schemas import (
 from app.modules.transfers.application.service import PhysicalCountService, TransferService
 from app.modules.transfers.domain.enums import PhysicalCountStatus, TransferStatus
 from app.modules.transfers.domain.models import PhysicalCount, Transfer
+from app.modules.purchasing.application.schemas import (
+    POCreateInput,
+    POLineCreateInput,
+    ReceiptCreateInput,
+    ReceiptLineCreateInput,
+    InvoiceCreateInput,
+)
+from app.modules.purchasing.application.service import (
+    PurchaseOrderService,
+    ReceivingService,
+    InvoiceService,
+)
+from app.modules.purchasing.domain.models import PurchaseOrder
 
 configure_logging(json_logs=False, log_level="INFO")
 log = structlog.get_logger()
@@ -801,6 +814,303 @@ async def seed_physical_counts(
 
 
 # ---------------------------------------------------------------------------
+# purchasing seed
+# ---------------------------------------------------------------------------
+
+async def _po_exists(session: AsyncSession, po_number: str) -> bool:
+    result = await session.execute(
+        select(PurchaseOrder).where(
+            PurchaseOrder.po_number == po_number,
+            PurchaseOrder.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def seed_purchasing(
+    session: AsyncSession,
+    ingredients: dict[str, object],
+    locations: dict[str, object],
+    suppliers: dict[str, object],
+) -> None:
+    """
+    Seeds three purchase orders covering the main PO lifecycle states:
+
+    PO-SEED-001  — Prime Meats Ltd.   — fully received + matched invoice
+    PO-SEED-002  — Global Dry Goods   — sent, partially received (one receipt completed)
+    PO-SEED-003  — Fresh Farms Co.    — draft (not yet sent)
+    """
+    po_svc = PurchaseOrderService(session)
+    rcv_svc = ReceivingService(session)
+    inv_svc = InvoiceService(session)
+
+    # -----------------------------------------------------------------------
+    # PO-SEED-001: Prime Meats Ltd. — fully received, invoice matched
+    # -----------------------------------------------------------------------
+    MEATS_PO_NUMBER = "PO-SEED-001"
+    if not await _po_exists(session, MEATS_PO_NUMBER):
+        po1 = await po_svc.create(
+            POCreateInput(
+                supplier_id=suppliers["Prime Meats Ltd."].entity_id,
+                expected_delivery_date=TODAY - timedelta(days=3),
+                notes="[SEED] Weekly meat restocking order",
+            )
+        )
+        # Override auto-generated number with stable seed key
+        po1_repo = po_svc.repo
+        po1 = await po1_repo.update(po1, po_number=MEATS_PO_NUMBER)
+        await session.commit()
+
+        # Add lines
+        beef_line = await po_svc.add_line(
+            po1.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["BEEF-001"].entity_id,
+                ordered_quantity=Decimal("15.00"),
+                unit_cost=Decimal("25.00"),
+            ),
+        )
+        await po_svc.add_line(
+            po1.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["PORK-001"].entity_id,
+                ordered_quantity=Decimal("10.00"),
+                unit_cost=Decimal("8.20"),
+            ),
+        )
+        await po_svc.add_line(
+            po1.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["BEEF-002"].entity_id,
+                ordered_quantity=Decimal("20.00"),
+                unit_cost=Decimal("7.80"),
+            ),
+        )
+
+        # Send
+        po1 = await po_svc.send(po1.entity_id)
+
+        # Create and complete a goods receipt
+        receipt1 = await rcv_svc.create(
+            ReceiptCreateInput(
+                order_id=po1.entity_id,
+                destination_location_id=locations["FRZ-01"].entity_id,
+                notes="[SEED] Meat delivery received at freezer",
+            )
+        )
+        await rcv_svc.add_line(
+            receipt1.entity_id,
+            ReceiptLineCreateInput(
+                ingredient_id=ingredients["BEEF-001"].entity_id,
+                batch_number="PO-SEED-001-BEEF-001",
+                lot_number="L2025-MEATS-A",
+                expiry_date=TODAY + timedelta(days=14),
+                received_quantity=Decimal("15.00"),
+                unit_cost=Decimal("25.00"),
+            ),
+        )
+        await rcv_svc.add_line(
+            receipt1.entity_id,
+            ReceiptLineCreateInput(
+                ingredient_id=ingredients["PORK-001"].entity_id,
+                batch_number="PO-SEED-001-PORK-001",
+                lot_number="L2025-MEATS-B",
+                expiry_date=TODAY + timedelta(days=10),
+                received_quantity=Decimal("10.00"),
+                unit_cost=Decimal("8.20"),
+            ),
+        )
+        await rcv_svc.add_line(
+            receipt1.entity_id,
+            ReceiptLineCreateInput(
+                ingredient_id=ingredients["BEEF-002"].entity_id,
+                batch_number="PO-SEED-001-BEEF-002",
+                lot_number="L2025-MEATS-C",
+                expiry_date=TODAY + timedelta(days=12),
+                received_quantity=Decimal("20.00"),
+                unit_cost=Decimal("7.80"),
+            ),
+        )
+        await rcv_svc.complete(receipt1.entity_id)
+
+        # Create invoice and match it
+        invoice1 = await inv_svc.create(
+            InvoiceCreateInput(
+                order_id=po1.entity_id,
+                invoice_number="INV-MEATS-SEED-001",
+                invoice_date=TODAY - timedelta(days=3),
+                due_date=TODAY + timedelta(days=27),
+                total_amount=Decimal("15.00") * Decimal("25.00")
+                    + Decimal("10.00") * Decimal("8.20")
+                    + Decimal("20.00") * Decimal("7.80"),
+                notes="[SEED] Invoice from Prime Meats",
+            )
+        )
+        await inv_svc.match(invoice1.entity_id)
+
+        log.info(
+            "PO seeded (fully received, invoice matched)",
+            po_number=MEATS_PO_NUMBER,
+            supplier="Prime Meats Ltd.",
+        )
+    else:
+        log.info("PO already exists, skipping", po_number=MEATS_PO_NUMBER)
+
+    # -----------------------------------------------------------------------
+    # PO-SEED-002: Global Dry Goods — sent, partially received
+    # -----------------------------------------------------------------------
+    DRY_PO_NUMBER = "PO-SEED-002"
+    if not await _po_exists(session, DRY_PO_NUMBER):
+        po2 = await po_svc.create(
+            POCreateInput(
+                supplier_id=suppliers["Global Dry Goods Inc."].entity_id,
+                expected_delivery_date=TODAY + timedelta(days=2),
+                notes="[SEED] Dry goods replenishment order",
+            )
+        )
+        po2_repo = po_svc.repo
+        po2 = await po2_repo.update(po2, po_number=DRY_PO_NUMBER)
+        await session.commit()
+
+        await po_svc.add_line(
+            po2.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["DRY-001"].entity_id,
+                ordered_quantity=Decimal("50.00"),
+                unit_cost=Decimal("0.95"),
+            ),
+        )
+        await po_svc.add_line(
+            po2.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["DRY-005"].entity_id,
+                ordered_quantity=Decimal("24.00"),
+                unit_cost=Decimal("7.80"),
+            ),
+        )
+        await po_svc.add_line(
+            po2.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["SPC-001"].entity_id,
+                ordered_quantity=Decimal("1000.00"),
+                unit_cost=Decimal("0.03"),
+            ),
+        )
+
+        po2 = await po_svc.send(po2.entity_id)
+
+        # Partial receipt — only DRY-001 and DRY-005 delivered so far
+        receipt2 = await rcv_svc.create(
+            ReceiptCreateInput(
+                order_id=po2.entity_id,
+                destination_location_id=locations["WH-01"].entity_id,
+                notes="[SEED] Partial dry goods delivery",
+            )
+        )
+        await rcv_svc.add_line(
+            receipt2.entity_id,
+            ReceiptLineCreateInput(
+                ingredient_id=ingredients["DRY-001"].entity_id,
+                batch_number="PO-SEED-002-DRY-001",
+                lot_number="L2025-DRY-A",
+                expiry_date=TODAY + timedelta(days=365),
+                received_quantity=Decimal("50.00"),
+                unit_cost=Decimal("0.95"),
+            ),
+        )
+        await rcv_svc.add_line(
+            receipt2.entity_id,
+            ReceiptLineCreateInput(
+                ingredient_id=ingredients["DRY-005"].entity_id,
+                batch_number="PO-SEED-002-DRY-005",
+                lot_number="L2025-DRY-B",
+                expiry_date=TODAY + timedelta(days=540),
+                received_quantity=Decimal("24.00"),
+                unit_cost=Decimal("7.80"),
+            ),
+        )
+        await rcv_svc.complete(receipt2.entity_id)
+
+        # Invoice pending for partial amount
+        await inv_svc.create(
+            InvoiceCreateInput(
+                order_id=po2.entity_id,
+                invoice_number="INV-DRY-SEED-001",
+                invoice_date=TODAY,
+                due_date=TODAY + timedelta(days=30),
+                total_amount=Decimal("50.00") * Decimal("0.95")
+                    + Decimal("24.00") * Decimal("7.80"),
+                notes="[SEED] Partial invoice — SPC-001 pending",
+            )
+        )
+
+        log.info(
+            "PO seeded (partially received, invoice pending)",
+            po_number=DRY_PO_NUMBER,
+            supplier="Global Dry Goods Inc.",
+        )
+    else:
+        log.info("PO already exists, skipping", po_number=DRY_PO_NUMBER)
+
+    # -----------------------------------------------------------------------
+    # PO-SEED-003: Fresh Farms Co. — draft (not yet sent)
+    # -----------------------------------------------------------------------
+    FARMS_PO_NUMBER = "PO-SEED-003"
+    if not await _po_exists(session, FARMS_PO_NUMBER):
+        po3 = await po_svc.create(
+            POCreateInput(
+                supplier_id=suppliers["Fresh Farms Co."].entity_id,
+                expected_delivery_date=TODAY + timedelta(days=5),
+                notes="[SEED] Vegetables and dairy restock",
+            )
+        )
+        po3_repo = po_svc.repo
+        po3 = await po3_repo.update(po3, po_number=FARMS_PO_NUMBER)
+        await session.commit()
+
+        await po_svc.add_line(
+            po3.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["VEG-001"].entity_id,
+                ordered_quantity=Decimal("20.00"),
+                unit_cost=Decimal("1.20"),
+            ),
+        )
+        await po_svc.add_line(
+            po3.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["VEG-004"].entity_id,
+                ordered_quantity=Decimal("30.00"),
+                unit_cost=Decimal("0.60"),
+            ),
+        )
+        await po_svc.add_line(
+            po3.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["DAI-001"].entity_id,
+                ordered_quantity=Decimal("40.00"),
+                unit_cost=Decimal("1.00"),
+            ),
+        )
+        await po_svc.add_line(
+            po3.entity_id,
+            POLineCreateInput(
+                ingredient_id=ingredients["DAI-003"].entity_id,
+                ordered_quantity=Decimal("8.00"),
+                unit_cost=Decimal("6.20"),
+            ),
+        )
+
+        log.info(
+            "PO seeded (draft, not yet sent)",
+            po_number=FARMS_PO_NUMBER,
+            supplier="Fresh Farms Co.",
+        )
+    else:
+        log.info("PO already exists, skipping", po_number=FARMS_PO_NUMBER)
+
+
+# ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
 
@@ -831,6 +1141,10 @@ async def run_seed() -> None:
         # Physical counts (PhysicalCountService commits internally)
         log.info("--- seeding physical counts ---")
         await seed_physical_counts(session, locations)
+
+        # Purchasing (PurchaseOrderService, ReceivingService, InvoiceService commit internally)
+        log.info("--- seeding purchasing ---")
+        await seed_purchasing(session, ingredients, locations, suppliers)
 
     log.info("seed complete")
 
