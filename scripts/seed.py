@@ -69,6 +69,14 @@ from app.modules.purchasing.application.service import (
     InvoiceService,
 )
 from app.modules.purchasing.domain.models import PurchaseOrder
+from app.modules.production.application.schemas import (
+    RecipeCreateInput,
+    RecipeIngredientCreateInput,
+    ProductionOrderCreateInput,
+    CompleteOrderInput,
+)
+from app.modules.production.application.service import RecipeService, ProductionOrderService
+from app.modules.production.domain.models import Recipe, ProductionOrder as ProdOrder
 
 configure_logging(json_logs=False, log_level="INFO")
 log = structlog.get_logger()
@@ -1111,6 +1119,307 @@ async def seed_purchasing(
 
 
 # ---------------------------------------------------------------------------
+# production seed
+# ---------------------------------------------------------------------------
+
+async def _recipe_exists(session: AsyncSession, name: str) -> bool:
+    result = await session.execute(
+        select(Recipe).where(
+            Recipe.name == name,
+            Recipe.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def _prod_order_exists(session: AsyncSession, order_number: str) -> bool:
+    result = await session.execute(
+        select(ProdOrder).where(
+            ProdOrder.order_number == order_number,
+            ProdOrder.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def seed_production(
+    session: AsyncSession,
+    ingredients: dict[str, object],
+    locations: dict[str, object],
+    units: dict[str, object],
+) -> None:
+    """
+    Seeds three recipes and production orders covering the full lifecycle:
+
+    Recipes:
+      - "Beef Tenderloin Medallions"   — beef-forward, uses spices
+      - "Pasta Penne al Pomodoro"      — dry-goods recipe
+      - "Sparkling Lemon Dressing"     — simple beverages-based sauce
+
+    Production Orders:
+      PRD-SEED-001  — Beef Tenderloin Medallions  — completed (movements fired)
+      PRD-SEED-002  — Pasta Penne al Pomodoro     — in_progress (started)
+      PRD-SEED-003  — Sparkling Lemon Dressing    — draft
+    """
+    recipe_svc = RecipeService(session)
+    order_svc = ProductionOrderService(session)
+
+    # -------------------------------------------------------------------
+    # Recipe 1: Spiced Dry Rub Mix
+    # All ingredients stocked at WH-01: SPC-001, SPC-002, DRY-005
+    # Yields 10 portions (small dry-rub sachets)
+    # -------------------------------------------------------------------
+    RUB_RECIPE_NAME = "Spiced Dry Rub Mix"
+    if not await _recipe_exists(session, RUB_RECIPE_NAME):
+        r1 = await recipe_svc.create(
+            RecipeCreateInput(
+                name=RUB_RECIPE_NAME,
+                description="Black pepper, sea salt and olive oil dry-rub blend for meats",
+                yield_quantity=Decimal("10"),
+                yield_unit_id=units["por"].entity_id,
+                is_active=True,
+                notes="[SEED]",
+            )
+        )
+        await recipe_svc.add_ingredient(
+            r1.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["SPC-001"].entity_id,
+                quantity=Decimal("8.0"),   # 8 g black pepper per batch
+                unit_of_measure_id=units["g"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r1.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["SPC-002"].entity_id,
+                quantity=Decimal("0.010"),  # 10 g sea salt per batch (stored in kg)
+                unit_of_measure_id=units["kg"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r1.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["DRY-005"].entity_id,
+                quantity=Decimal("0.020"),  # 20 mL olive oil per batch
+                unit_of_measure_id=units["L"].entity_id,
+            ),
+        )
+        log.info("recipe created", name=RUB_RECIPE_NAME)
+    else:
+        result = await session.execute(
+            select(Recipe).where(
+                Recipe.name == RUB_RECIPE_NAME,
+                Recipe.is_deleted.is_(False),
+            )
+        )
+        r1 = result.scalar_one()
+        log.info("recipe already exists, skipping", name=RUB_RECIPE_NAME)
+
+    # -------------------------------------------------------------------
+    # Recipe 2: Penne al Olio
+    # All ingredients stocked at WH-01: DRY-003, DRY-005, SPC-001, SPC-002
+    # Yields 2 portions
+    # -------------------------------------------------------------------
+    PENNE_RECIPE_NAME = "Penne al Olio"
+    if not await _recipe_exists(session, PENNE_RECIPE_NAME):
+        r2 = await recipe_svc.create(
+            RecipeCreateInput(
+                name=PENNE_RECIPE_NAME,
+                description="Penne pasta tossed with olive oil, black pepper and sea salt",
+                yield_quantity=Decimal("2"),
+                yield_unit_id=units["por"].entity_id,
+                is_active=True,
+                notes="[SEED]",
+            )
+        )
+        await recipe_svc.add_ingredient(
+            r2.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["DRY-003"].entity_id,
+                quantity=Decimal("0.200"),  # 200 g pasta per batch
+                unit_of_measure_id=units["kg"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r2.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["DRY-005"].entity_id,
+                quantity=Decimal("0.030"),  # 30 mL olive oil per batch
+                unit_of_measure_id=units["L"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r2.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["SPC-001"].entity_id,
+                quantity=Decimal("4.0"),  # 4 g black pepper per batch
+                unit_of_measure_id=units["g"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r2.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["SPC-002"].entity_id,
+                quantity=Decimal("0.006"),  # 6 g sea salt per batch (stored in kg)
+                unit_of_measure_id=units["kg"].entity_id,
+            ),
+        )
+        log.info("recipe created", name=PENNE_RECIPE_NAME)
+    else:
+        result = await session.execute(
+            select(Recipe).where(
+                Recipe.name == PENNE_RECIPE_NAME,
+                Recipe.is_deleted.is_(False),
+            )
+        )
+        r2 = result.scalar_one()
+        log.info("recipe already exists, skipping", name=PENNE_RECIPE_NAME)
+
+    # -------------------------------------------------------------------
+    # Recipe 3: Sparkling Lemon Dressing
+    # All ingredients stocked at WH-01: BEV-001, DRY-005, SPC-002
+    # Yields 1 L
+    # -------------------------------------------------------------------
+    DRESSING_RECIPE_NAME = "Sparkling Lemon Dressing"
+    if not await _recipe_exists(session, DRESSING_RECIPE_NAME):
+        r3 = await recipe_svc.create(
+            RecipeCreateInput(
+                name=DRESSING_RECIPE_NAME,
+                description="Light dressing made with sparkling water, olive oil and sea salt",
+                yield_quantity=Decimal("1"),
+                yield_unit_id=units["L"].entity_id,
+                is_active=True,
+                notes="[SEED]",
+            )
+        )
+        await recipe_svc.add_ingredient(
+            r3.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["BEV-001"].entity_id,
+                quantity=Decimal("2"),    # 2 cans sparkling water
+                unit_of_measure_id=units["u"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r3.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["DRY-005"].entity_id,
+                quantity=Decimal("0.050"),  # 50 mL olive oil
+                unit_of_measure_id=units["L"].entity_id,
+            ),
+        )
+        await recipe_svc.add_ingredient(
+            r3.entity_id,
+            RecipeIngredientCreateInput(
+                ingredient_id=ingredients["SPC-002"].entity_id,
+                quantity=Decimal("0.005"),  # 5 g sea salt (stored in kg)
+                unit_of_measure_id=units["kg"].entity_id,
+            ),
+        )
+        log.info("recipe created", name=DRESSING_RECIPE_NAME)
+    else:
+        result = await session.execute(
+            select(Recipe).where(
+                Recipe.name == DRESSING_RECIPE_NAME,
+                Recipe.is_deleted.is_(False),
+            )
+        )
+        r3 = result.scalar_one()
+        log.info("recipe already exists, skipping", name=DRESSING_RECIPE_NAME)
+
+    # -------------------------------------------------------------------
+    # Production Order 1: Spiced Dry Rub Mix — COMPLETED
+    # Source: WH-01. 2 batches × (8g SPC-001 + 10g SPC-002 + 0.020L DRY-005)
+    # WH-01 after prior seeds: SPC-001≈500g, SPC-002≈10kg, DRY-005≈10L — plenty.
+    # -------------------------------------------------------------------
+    PRD1_NUMBER = "PRD-SEED-001"
+    if not await _prod_order_exists(session, PRD1_NUMBER):
+        o1 = await order_svc.create(
+            ProductionOrderCreateInput(
+                recipe_id=r1.entity_id,
+                source_location_id=locations["WH-01"].entity_id,
+                quantity_to_produce=Decimal("2"),
+                scheduled_date=TODAY - timedelta(days=1),
+                notes="[SEED] Pre-service dry rub batch",
+            )
+        )
+        o1 = await order_svc.repo.update(o1, order_number=PRD1_NUMBER)
+        await session.commit()
+
+        o1 = await order_svc.confirm(o1.entity_id)
+        o1 = await order_svc.start(o1.entity_id)
+        o1 = await order_svc.complete(
+            o1.entity_id,
+            CompleteOrderInput(
+                actual_yield=Decimal("19"),
+                notes="[SEED] Slight under-yield — one sachet below weight",
+            ),
+        )
+        log.info(
+            "production order seeded (completed)",
+            order_number=PRD1_NUMBER,
+            recipe=RUB_RECIPE_NAME,
+        )
+    else:
+        log.info("production order already exists, skipping", order_number=PRD1_NUMBER)
+
+    # -------------------------------------------------------------------
+    # Production Order 2: Penne al Olio — IN PROGRESS
+    # Source: WH-01. 3 batches × (200g DRY-003 + 30mL DRY-005 + 4g SPC-001 + 6g SPC-002)
+    # -------------------------------------------------------------------
+    PRD2_NUMBER = "PRD-SEED-002"
+    if not await _prod_order_exists(session, PRD2_NUMBER):
+        o2 = await order_svc.create(
+            ProductionOrderCreateInput(
+                recipe_id=r2.entity_id,
+                source_location_id=locations["WH-01"].entity_id,
+                quantity_to_produce=Decimal("3"),
+                scheduled_date=TODAY,
+                notes="[SEED] Lunch service pasta",
+            )
+        )
+        o2 = await order_svc.repo.update(o2, order_number=PRD2_NUMBER)
+        await session.commit()
+
+        o2 = await order_svc.confirm(o2.entity_id)
+        o2 = await order_svc.start(o2.entity_id)
+        log.info(
+            "production order seeded (in_progress)",
+            order_number=PRD2_NUMBER,
+            recipe=PENNE_RECIPE_NAME,
+        )
+    else:
+        log.info("production order already exists, skipping", order_number=PRD2_NUMBER)
+
+    # -------------------------------------------------------------------
+    # Production Order 3: Sparkling Lemon Dressing — DRAFT
+    # Source: WH-01. 5 batches × (2u BEV-001 + 50mL DRY-005 + 5g SPC-002)
+    # WH-01 after prior seeds: BEV-001≈84u, DRY-005≈10L, SPC-002≈10kg — plenty.
+    # -------------------------------------------------------------------
+    PRD3_NUMBER = "PRD-SEED-003"
+    if not await _prod_order_exists(session, PRD3_NUMBER):
+        o3 = await order_svc.create(
+            ProductionOrderCreateInput(
+                recipe_id=r3.entity_id,
+                source_location_id=locations["WH-01"].entity_id,
+                quantity_to_produce=Decimal("5"),
+                scheduled_date=TODAY + timedelta(days=1),
+                notes="[SEED] Tomorrow's service dressings",
+            )
+        )
+        o3 = await order_svc.repo.update(o3, order_number=PRD3_NUMBER)
+        await session.commit()
+        log.info(
+            "production order seeded (draft)",
+            order_number=PRD3_NUMBER,
+            recipe=DRESSING_RECIPE_NAME,
+        )
+    else:
+        log.info("production order already exists, skipping", order_number=PRD3_NUMBER)
+
+
+# ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
 
@@ -1145,6 +1454,10 @@ async def run_seed() -> None:
         # Purchasing (PurchaseOrderService, ReceivingService, InvoiceService commit internally)
         log.info("--- seeding purchasing ---")
         await seed_purchasing(session, ingredients, locations, suppliers)
+
+        # Production (RecipeService, ProductionOrderService commit internally)
+        log.info("--- seeding production ---")
+        await seed_production(session, ingredients, locations, units)
 
     log.info("seed complete")
 
