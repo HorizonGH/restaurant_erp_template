@@ -25,6 +25,7 @@ import app.modules.catalog.domain.models  # noqa: F401
 import app.modules.inventory.domain.models  # noqa: F401
 import app.modules.transfers.domain.models  # noqa: F401
 import app.modules.purchasing.domain.models  # noqa: F401
+import app.modules.production.domain.models  # noqa: F401
 
 target_metadata = Base.metadata
 

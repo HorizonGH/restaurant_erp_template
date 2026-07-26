@@ -8,6 +8,7 @@ from app.modules.catalog.presentation.router import router as catalog_router
 from app.modules.inventory.presentation.router import router as inventory_router
 from app.modules.transfers.presentation.router import router as transfers_router
 from app.modules.purchasing.presentation.router import router as purchasing_router
+from app.modules.production.presentation.router import router as production_router
 
 configure_logging(json_logs=settings.log_json, log_level=settings.log_level)
 
@@ -23,6 +24,7 @@ app.include_router(catalog_router, prefix="/api/v1/catalog")
 app.include_router(inventory_router, prefix="/api/v1/inventory")
 app.include_router(transfers_router, prefix="/api/v1/transfers")
 app.include_router(purchasing_router, prefix="/api/v1/purchasing")
+app.include_router(production_router, prefix="/api/v1/production")
 
 
 @app.get("/api/v1/health")
