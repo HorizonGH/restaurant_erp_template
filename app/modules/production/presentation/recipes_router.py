@@ -36,7 +36,7 @@ async def select_recipes(
 
 @router.get("/", response_model=APIResponse[Page[RecipeOutput]])
 async def list_recipes(
-    params: Annotated[PageParams, Query()],
+    params: Annotated[PageParams, Depends()],
     name: str | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     ordering: str | None = Query(default=None),
