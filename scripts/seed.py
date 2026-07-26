@@ -47,6 +47,15 @@ from app.modules.inventory.application.schemas import (
 from app.modules.inventory.application.service import MovementService
 from app.modules.inventory.domain.enums import LocationType
 from app.modules.inventory.domain.models import Location
+from app.modules.transfers.application.schemas import (
+    PhysicalCountCreateInput,
+    PhysicalCountLineRecordInput,
+    TransferCreateInput,
+    TransferLineCreateInput,
+)
+from app.modules.transfers.application.service import PhysicalCountService, TransferService
+from app.modules.transfers.domain.enums import PhysicalCountStatus, TransferStatus
+from app.modules.transfers.domain.models import PhysicalCount, Transfer
 
 configure_logging(json_logs=False, log_level="INFO")
 log = structlog.get_logger()
@@ -562,6 +571,236 @@ async def seed_inventory_movements(
 
 
 # ---------------------------------------------------------------------------
+# transfers seed
+# ---------------------------------------------------------------------------
+
+async def _transfer_exists(session: AsyncSession, transfer_number: str) -> bool:
+    result = await session.execute(
+        select(Transfer).where(
+            Transfer.transfer_number == transfer_number,
+            Transfer.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def seed_transfers(
+    session: AsyncSession,
+    ingredients: dict[str, Ingredient],
+    locations: dict[str, Location],
+) -> None:
+    """
+    Seeds three realistic transfers that exercise the full lifecycle:
+
+    1. WH-01 → FRG-01  (completed)  — daily fridge restock
+    2. FRZ-01 → FRG-01 (in_transit) — frozen-to-fridge thawing transfer
+    3. WH-01 → BAR-01  (draft)      — bar restock not yet sent
+    """
+    svc = TransferService(session)
+
+    wh   = locations["WH-01"]
+    frdg = locations["FRG-01"]
+    frzr = locations["FRZ-01"]
+    bar  = locations["BAR-01"]
+    prod = locations["PROD-01"]
+
+    from app.modules.transfers.infrastructure.repository import TransferRepository
+    repo = TransferRepository(session)
+
+    # ------------------------------------------------------------------
+    # 1. Completed transfer: warehouse → bar (dry goods restock)
+    #    WH-01 stocks: DRY-*, SPC-*, BEV-001
+    # ------------------------------------------------------------------
+    COMPLETED_NUM = "TRF-SEED-001"
+    if not await _transfer_exists(session, COMPLETED_NUM):
+        t1 = await svc.create(TransferCreateInput(
+            from_location_id=wh.entity_id,
+            to_location_id=bar.entity_id,
+            notes="Bar restock — dry goods and beverages from warehouse",
+        ))
+        t1 = await repo.update(t1, transfer_number=COMPLETED_NUM)
+        await session.commit()
+
+        for sku, qty in [
+            ("BEV-001", "12.00"),   # sparkling water — WH-01 has 96 units
+            ("DRY-005", "2.00"),    # olive oil — WH-01 has 12 L
+        ]:
+            await svc.add_line(t1.entity_id, TransferLineCreateInput(
+                ingredient_id=ingredients[sku].entity_id,
+                requested_quantity=Decimal(qty),
+            ))
+
+        await svc.send(t1.entity_id)
+        await svc.receive(t1.entity_id)
+        log.info("transfer seeded (completed)", number=COMPLETED_NUM)
+    else:
+        log.info("transfer already exists, skipping", number=COMPLETED_NUM)
+
+    # ------------------------------------------------------------------
+    # 2. In-transit transfer: freezer → fridge (overnight thaw)
+    #    FRZ-01 stocks: BEEF-001/002/003, PORK-001/002, POL-003, SEA-002
+    # ------------------------------------------------------------------
+    IN_TRANSIT_NUM = "TRF-SEED-002"
+    if not await _transfer_exists(session, IN_TRANSIT_NUM):
+        t2 = await svc.create(TransferCreateInput(
+            from_location_id=frzr.entity_id,
+            to_location_id=frdg.entity_id,
+            notes="Overnight thaw — frozen meats to fridge for tomorrow's service",
+        ))
+        t2 = await repo.update(t2, transfer_number=IN_TRANSIT_NUM)
+        await session.commit()
+
+        for sku, qty in [
+            ("BEEF-001", "3.00"),   # beef tenderloin — FRZ-01 has 15 kg
+            ("PORK-001", "2.00"),   # pork belly — FRZ-01 has 12 kg
+        ]:
+            await svc.add_line(t2.entity_id, TransferLineCreateInput(
+                ingredient_id=ingredients[sku].entity_id,
+                requested_quantity=Decimal(qty),
+            ))
+
+        await svc.send(t2.entity_id)
+        log.info("transfer seeded (in_transit)", number=IN_TRANSIT_NUM)
+    else:
+        log.info("transfer already exists, skipping", number=IN_TRANSIT_NUM)
+
+    # ------------------------------------------------------------------
+    # 3. Draft transfer: warehouse → kitchen (spice restocking, not yet sent)
+    #    WH-01 stocks: SPC-001/002/003/004, DRY-*
+    # ------------------------------------------------------------------
+    DRAFT_NUM = "TRF-SEED-003"
+    if not await _transfer_exists(session, DRAFT_NUM):
+        t3 = await svc.create(TransferCreateInput(
+            from_location_id=wh.entity_id,
+            to_location_id=prod.entity_id,
+            notes="Kitchen spice restocking — pending head chef approval",
+        ))
+        t3 = await repo.update(t3, transfer_number=DRAFT_NUM)
+        await session.commit()
+
+        for sku, qty in [
+            ("SPC-001", "100.00"),  # black pepper — WH-01 has 500 g
+            ("SPC-002", "2.00"),    # sea salt — WH-01 has 10 kg
+            ("DRY-006", "5.00"),    # chicken stock — WH-01 has 20 L
+        ]:
+            await svc.add_line(t3.entity_id, TransferLineCreateInput(
+                ingredient_id=ingredients[sku].entity_id,
+                requested_quantity=Decimal(qty),
+            ))
+
+        log.info("transfer seeded (draft)", number=DRAFT_NUM)
+    else:
+        log.info("transfer already exists, skipping", number=DRAFT_NUM)
+
+
+# ---------------------------------------------------------------------------
+# physical counts seed
+# ---------------------------------------------------------------------------
+
+async def _count_exists(session: AsyncSession, location_id, notes_prefix: str) -> bool:
+    result = await session.execute(
+        select(PhysicalCount).where(
+            PhysicalCount.location_id == location_id,
+            PhysicalCount.notes.like(f"{notes_prefix}%"),
+            PhysicalCount.is_deleted.is_(False),
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def seed_physical_counts(
+    session: AsyncSession,
+    locations: dict[str, Location],
+) -> None:
+    """
+    Seeds two physical counts:
+
+    1. Walk-in Fridge — completed, with realistic variances applied
+    2. Main Warehouse  — in_progress, partially counted (some lines still null)
+    """
+    svc = PhysicalCountService(session)
+
+    frdg = locations["FRG-01"]
+    wh   = locations["WH-01"]
+
+    # ------------------------------------------------------------------
+    # 1. Completed count: fridge — weekly check found minor shrinkage
+    # ------------------------------------------------------------------
+    FRIDGE_NOTES = "[SEED] Weekly fridge count — post-service"
+    if not await _count_exists(session, frdg.entity_id, "[SEED] Weekly fridge"):
+        count1 = await svc.create(PhysicalCountCreateInput(
+            location_id=frdg.entity_id,
+            notes=FRIDGE_NOTES,
+        ))
+
+        lines = await svc.list_lines(count1.entity_id)
+
+        # Submit counted quantities — most match system, a few have variance
+        variances: dict[str, Decimal] = {
+            # sku-like hint: we identify lines by ingredient_id later
+            # negative = found less than system (shrinkage/spillage)
+            # positive = found more (unrecorded entry)
+        }
+
+        # Build ingredient_id → adjustment map from the seeded ingredients
+        # We use the known seeded stock levels and apply small realistic variances
+        # keyed by ingredient position in the lines list
+        for i, line in enumerate(lines):
+            if i % 4 == 0:
+                # Every 4th line: slight deficit (spillage, evaporation)
+                counted = max(Decimal("0"), line.system_quantity - Decimal("0.30"))
+            elif i % 7 == 0:
+                # Every 7th line: slight surplus (unregistered delivery fragment)
+                counted = line.system_quantity + Decimal("0.20")
+            else:
+                # All others: exact match
+                counted = line.system_quantity
+
+            await svc.record_line(
+                count1.entity_id,
+                line.entity_id,
+                PhysicalCountLineRecordInput(counted_quantity=counted),
+            )
+
+        await svc.complete(count1.entity_id)
+        log.info("physical count seeded (completed)", location="FRG-01")
+    else:
+        log.info("physical count already exists, skipping", location="FRG-01")
+
+    # ------------------------------------------------------------------
+    # 2. In-progress count: warehouse — partially counted
+    # ------------------------------------------------------------------
+    WH_NOTES = "[SEED] Monthly warehouse stocktake — in progress"
+    if not await _count_exists(session, wh.entity_id, "[SEED] Monthly warehouse"):
+        count2 = await svc.create(PhysicalCountCreateInput(
+            location_id=wh.entity_id,
+            notes=WH_NOTES,
+        ))
+
+        lines = await svc.list_lines(count2.entity_id)
+
+        # Only count the first half of lines — simulates staff still working
+        halfway = len(lines) // 2
+        for line in lines[:halfway]:
+            counted = max(Decimal("0"), line.system_quantity - Decimal("0.10"))
+            await svc.record_line(
+                count2.entity_id,
+                line.entity_id,
+                PhysicalCountLineRecordInput(counted_quantity=counted),
+            )
+
+        # Leave the rest as null — count is still in_progress
+        log.info(
+            "physical count seeded (in_progress)",
+            location="WH-01",
+            lines_counted=halfway,
+            lines_pending=len(lines) - halfway,
+        )
+    else:
+        log.info("physical count already exists, skipping", location="WH-01")
+
+
+# ---------------------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------------------
 
@@ -584,6 +823,14 @@ async def run_seed() -> None:
         # Movements need their own commits (MovementService commits internally)
         log.info("--- seeding inventory movements ---")
         await seed_inventory_movements(session, ingredients, locations)
+
+        # Transfers (TransferService commits internally)
+        log.info("--- seeding transfers ---")
+        await seed_transfers(session, ingredients, locations)
+
+        # Physical counts (PhysicalCountService commits internally)
+        log.info("--- seeding physical counts ---")
+        await seed_physical_counts(session, locations)
 
     log.info("seed complete")
 
