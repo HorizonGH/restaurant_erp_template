@@ -24,6 +24,7 @@ if config.config_file_name is not None:
 import app.modules.catalog.domain.models  # noqa: F401
 import app.modules.inventory.domain.models  # noqa: F401
 import app.modules.transfers.domain.models  # noqa: F401
+import app.modules.purchasing.domain.models  # noqa: F401
 
 target_metadata = Base.metadata
 
