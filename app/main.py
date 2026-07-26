@@ -6,6 +6,7 @@ from app.core.shared.presentation.exception_handlers import register_exception_h
 from app.middlewares.logging_middleware import LoggingMiddleware
 from app.modules.catalog.presentation.router import router as catalog_router
 from app.modules.inventory.presentation.router import router as inventory_router
+from app.modules.transfers.presentation.router import router as transfers_router
 
 configure_logging(json_logs=settings.log_json, log_level=settings.log_level)
 
@@ -19,6 +20,7 @@ register_exception_handlers(app)
 
 app.include_router(catalog_router, prefix="/api/v1/catalog")
 app.include_router(inventory_router, prefix="/api/v1/inventory")
+app.include_router(transfers_router, prefix="/api/v1/transfers")
 
 
 @app.get("/api/v1/health")
